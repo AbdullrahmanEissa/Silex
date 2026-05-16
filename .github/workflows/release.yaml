@@ -1,0 +1,57 @@
+name: Release Silex Images
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME_INGRESS: ${{ github.repository }}-ingress
+  IMAGE_NAME_OPERATOR: ${{ github.repository }}-operator
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata for Ingress
+        id: meta-ingress
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_INGRESS }}
+
+      - name: Build and push Ingress image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./silex-ingress
+          push: true
+          tags: ${{ steps.meta-ingress.outputs.tags }}
+          labels: ${{ steps.meta-ingress.outputs.labels }}
+
+      - name: Extract Docker metadata for Operator
+        id: meta-operator
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_OPERATOR }}
+
+      - name: Build and push Operator image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./silex-operator
+          push: true
+          tags: ${{ steps.meta-operator.outputs.tags }}
+          labels: ${{ steps.meta-operator.outputs.labels }}
