@@ -1,4 +1,3 @@
-```markdown
 # Silex: High-Performance Cloud-Native Ingress & Operator
 
 Silex is a ultra-lightweight, zero-overhead Custom Ingress Controller and Operator architecture designed for edge computing and resource-constrained environments. By shifting the request routing mechanics to raw byte manipulation in Rust and utilizing a native Go Operator for event-driven memory synchronization, Silex achieves sub-millisecond routing latency with near-zero memory utilization.
