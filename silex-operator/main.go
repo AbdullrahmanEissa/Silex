@@ -7,7 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
@@ -34,11 +34,11 @@ func main() {
 		DeleteFunc: func(obj interface{}) { processIngress(client, obj.(*networkingv1.Ingress)) },
 	})
 
-	epInformer := factory.Core().V1().Endpoints().Informer()
-	_, _ = epInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc:    func(obj interface{}) { processEndpoints(client, obj.(*corev1.Endpoints)) },
-		UpdateFunc: func(old, new interface{}) { processEndpoints(client, new.(*corev1.Endpoints)) },
-		DeleteFunc: func(obj interface{}) { processEndpoints(client, obj.(*corev1.Endpoints)) },
+	sliceInformer := factory.Discovery().V1().EndpointSlices().Informer()
+	_, _ = sliceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    func(obj interface{}) { processEndpointSlice(client, obj.(*discoveryv1.EndpointSlice)) },
+		UpdateFunc: func(old, new interface{}) { processEndpointSlice(client, new.(*discoveryv1.EndpointSlice)) },
+		DeleteFunc: func(obj interface{}) { processEndpointSlice(client, obj.(*discoveryv1.EndpointSlice)) },
 	})
 
 	stopCh := make(chan struct{})
@@ -59,19 +59,27 @@ func processIngress(client *kubernetes.Clientset, ing *networkingv1.Ingress) {
 		for _, path := range rule.HTTP.Paths {
 			if path.Backend.Service != nil {
 				svcName := path.Backend.Service.Name
-				ep, err := client.CoreV1().Endpoints(ing.Namespace).Get(context.Background(), svcName, metav1.GetOptions{})
+				labelSelector := fmt.Sprintf("kubernetes.io/service-name=%s", svcName)
+				slices, err := client.DiscoveryV1().EndpointSlices(ing.Namespace).List(context.Background(), metav1.ListOptions{LabelSelector: labelSelector})
 				if err != nil {
 					continue
 				}
 				port := path.Backend.Service.Port.Number
-				sendUpdatesFromEndpoints(rule.Host, port, ep)
+				for _, slice := range slices.Items {
+					sendUpdatesFromSlice(rule.Host, port, &slice)
+				}
 			}
 		}
 	}
 }
 
-func processEndpoints(client *kubernetes.Clientset, ep *corev1.Endpoints) {
-	ings, err := client.NetworkingV1().Ingresses(ep.Namespace).List(context.Background(), metav1.ListOptions{})
+func processEndpointSlice(client *kubernetes.Clientset, slice *discoveryv1.EndpointSlice) {
+	svcName, ok := slice.Labels["kubernetes.io/service-name"]
+	if !ok {
+		return
+	}
+
+	ings, err := client.NetworkingV1().Ingresses(slice.Namespace).List(context.Background(), metav1.ListOptions{})
 	if err != nil {
 		return
 	}
@@ -81,24 +89,27 @@ func processEndpoints(client *kubernetes.Clientset, ep *corev1.Endpoints) {
 				continue
 			}
 			for _, path := range rule.HTTP.Paths {
-				if path.Backend.Service != nil && path.Backend.Service.Name == ep.Name {
+				if path.Backend.Service != nil && path.Backend.Service.Name == svcName {
 					port := path.Backend.Service.Port.Number
-					sendUpdatesFromEndpoints(rule.Host, port, ep)
+					sendUpdatesFromSlice(rule.Host, port, slice)
 				}
 			}
 		}
 	}
 }
 
-func sendUpdatesFromEndpoints(host string, port int32, ep *corev1.Endpoints) {
-	for _, subset := range ep.Subsets {
-		for _, addr := range subset.Addresses {
-			target := fmt.Sprintf("%s:%d", addr.IP, port)
-			payload := types.RoutePayload{
-				Host: host,
-				IP:   target,
+func sendUpdatesFromSlice(host string, port int32, slice *discoveryv1.EndpointSlice) {
+	for _, ep := range slice.Endpoints {
+		// Only route to Pods that are fully healthy and ready!
+		if ep.Conditions.Ready != nil && *ep.Conditions.Ready {
+			for _, ip := range ep.Addresses {
+				target := fmt.Sprintf("%s:%d", ip, port)
+				payload := types.RoutePayload{
+					Host: host,
+					IP:   target,
+				}
+				_ = sync.SendRouteUpdate(payload)
 			}
-			_ = sync.SendRouteUpdate(payload)
 		}
 	}
 }
