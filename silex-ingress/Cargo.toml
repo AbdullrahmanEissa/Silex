@@ -7,4 +7,6 @@ edition = "2021"
 
 [dependencies]
 dashmap = "6.1.0"
+rustls = "0.21"
 tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.24"
