@@ -4,12 +4,12 @@
 Silex is a highly opinionated, ultra-fast Ingress Controller built from the ground up for modern Cloud-Native environments. By decoupling the Control Plane (written in Go) from the Data Plane (written in Rust), Silex achieves extreme raw throughput while maintaining zero-downtime dynamic routing.
 
 ## 🚀 The Core Problem & The Silex Solution
-Traditional Reverse Proxies (like Nginx) suffer from a fundamental architectural flaw in Kubernetes: **The Reload Penalty**. Every time a new Ingress is added, the proxy must reload its configuration, causing temporary CPU spikes and potential connection drops. Furthermore, traditional proxies rely heavily on heap memory allocation for parsing requests.
+Traditional Reverse Proxies (like Nginx) suffer from a fundamental architectural flaw in Kubernetes: **The Reload Penalty**. Every time a new Ingress is added, the proxy must reload its configuration, causing temporary CPU spikes and potential connection drops.
 
 **Silex solves this via:**
 1. **Dynamic In-Memory State:** $O(1)$ route injection without *ever* reloading the proxy process.
-2. **Zero-Allocation Parsing:** Network streams are processed directly via pointer references, eliminating Garbage Collection pauses and heap overhead.
-3. **Zero-Hop Routing:** The Go Operator bypasses `kube-proxy` entirely by watching `Endpoints` instead of `Services`, routing traffic directly to the exact Pod IPs.
+2. **Zero-Allocation Parsing:** Network streams are processed directly via pointer references, eliminating heap overhead.
+3. **Zero-Hop Routing:** The Go Operator bypasses `kube-proxy` entirely by watching modern K8s `EndpointSlices` instead of `Services`, routing traffic directly to the exact healthy Pod IPs.
 
 ---
 
@@ -17,7 +17,7 @@ Traditional Reverse Proxies (like Nginx) suffer from a fundamental architectural
 We subjected both Silex and Nginx to a brutal stress test on the exact same hardware, routing traffic to the same fast backend. 
 
 **Test Conditions:** 
-Tool: `wrk` | Threads: 12 | Connections: 400 | Duration: 30s | Environment: Local Kubernetes Cluster.
+Tool: `wrk` | Threads: 12 | Connections: 400 | Duration: 30s | Environment: Local Linux Machine.
 
 | Metric | Silex Ingress (Rust Data Plane) | Nginx Reverse Proxy | Performance Gain |
 | :--- | :--- | :--- | :--- |
@@ -25,42 +25,145 @@ Tool: `wrk` | Threads: 12 | Connections: 400 | Duration: 30s | Environment: Loca
 | **Average Latency** | **5.11 ms** | 34.00 ms | **~85% Reduction** |
 | **Data Transfer** | **20.95 MB/sec** | 3.43 MB/sec | **Massive Bandwidth Increase** |
 
-*Note: Silex maintained stable memory consumption throughout the test due to its lock-free data structures and strict Rust memory safety.*
-
 ---
 
-## 🧠 High-Level Architecture (How it works)
-Silex is composed of two primary micro-components tailored for strict separation of concerns:
+## ⚔️ Reproducing the Benchmark (Step-by-Step)
+For reviewers, content creators, and engineers: you can easily reproduce this throughput massacre on your own machine. Execute the following commands one by one.
 
-### 1. The Brain: `silex-operator` (Golang)
-- Acts as a custom Kubernetes Controller using `client-go`.
-- Listens to `Ingress` and `Endpoints` events in real-time.
-- Resolves the exact topology of the backend pods.
-- Pushes state changes incrementally to the Data Plane via a lightweight internal Sync API.
+### Step 1: Install Prerequisites
+Install the load testing tool (`wrk`) and `nginx`.
+```bash
+sudo apt update
 
-### 2. The Muscle: `silex-ingress` (Rust)
-- A bare-metal speed TCP/HTTP router.
-- Uses advanced Lock-Free Concurrency models to ensure no thread blocks another during high traffic.
-- Maintains routing tables purely in RAM.
-- Features custom-built Circuit Breaking and Health Probing to instantly isolate failing nodes without halting traffic.
+```
 
----
+```bash
+sudo apt install wrk nginx -y
 
-## 🛠️ Quick Start (Local Development)
+```
 
-### 1. Start the Data Plane (Rust)
+### Step 2: Setup the Fast Backend (Port 8080)
+
+Create a dummy file for the backend to serve:
+
+```bash
+echo "Hello from Fast Backend" | sudo tee /var/www/html/backend.html
+
+```
+
+Configure Nginx to act as the Backend on port 8080:
+
+```bash
+sudo tee /etc/nginx/sites-available/backend << 'EOF'
+server {
+    listen 8080;
+    location / {
+        root /var/www/html;
+        try_files /backend.html =404;
+    }
+}
+EOF
+
+```
+
+### Step 3: Setup Nginx as a Reverse Proxy (Port 8081)
+
+Configure Nginx to proxy traffic to the backend, optimized for maximum speed:
+
+```bash
+sudo tee /etc/nginx/sites-available/nginx-proxy << 'EOF'
+server {
+    listen 8081;
+    server_name bench.local;
+    location / {
+        proxy_pass [http://127.0.0.1:8080](http://127.0.0.1:8080);
+        proxy_set_header Host $host;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+    }
+}
+EOF
+
+```
+
+Enable the sites and restart Nginx:
+
+```bash
+sudo ln -sf /etc/nginx/sites-available/backend /etc/nginx/sites-enabled/
+
+```
+
+```bash
+sudo ln -sf /etc/nginx/sites-available/nginx-proxy /etc/nginx/sites-enabled/
+
+```
+
+```bash
+sudo rm -f /etc/nginx/sites-enabled/default
+
+```
+
+```bash
+sudo systemctl restart nginx
+
+```
+
+### Step 4: Build and Start Silex Ingress (Port 80)
+
+Clear port 80 just in case, then compile and run the Rust Data Plane:
+
+```bash
+sudo fuser -k 80/tcp 9090/tcp
+
+```
+
 ```bash
 cd silex-ingress
+
+```
+
+```bash
 cargo build --release
+
+```
+
+```bash
 sudo ./target/release/silex-ingress
 
 ```
 
-*(Silex listens on Port 80 for traffic, and Port 9090 for Operator sync).*
+*(⚠️ IMPORTANT: Leave this terminal open and running. Open a NEW terminal for the next steps).*
 
-### 2. Start the Control Plane (Go)
+### Step 5: Inject Route & Fire the Benchmark!
 
-In a separate terminal, point the operator to your Kubernetes cluster:
+In your **NEW** terminal, inject the route into Silex's memory (simulating the Go Operator):
+
+```bash
+curl -X POST [http://127.0.0.1:9090](http://127.0.0.1:9090) -d '{"host": "bench.local", "ip": "127.0.0.1:8080"}'
+
+```
+
+**Run the Nginx Benchmark:**
+
+```bash
+wrk -t12 -c400 -d30s -H "Host: bench.local" [http://127.0.0.1:8081/](http://127.0.0.1:8081/)
+
+```
+
+**Run the Silex Benchmark:**
+
+```bash
+wrk -t12 -c400 -d30s -H "Host: bench.local" [http://127.0.0.1:80/](http://127.0.0.1:80/)
+
+```
+
+---
+
+## 🛠️ Running the Full Kubernetes Operator
+
+To run the complete system inside a Kubernetes cluster (Control Plane + Data Plane):
+
+1. Point the Operator to your K8s cluster:
 
 ```bash
 cd silex-operator
@@ -68,12 +171,13 @@ go run main.go
 
 ```
 
-Deploy any standard Kubernetes `Ingress` resource, and watch Silex route traffic instantly without a single reload.
+2. The Go Operator will automatically watch for `Ingress` and `EndpointSlices` events, bypassing `kube-proxy`, and instantly push state changes to the Rust Data Plane on port 9090.
 
 ---
 
 ## 📄 License
 
-This project is proprietary / Open Source (Check LICENSE file). Architecture designed for extreme performance edge cases.
-
+Check the `LICENSE` file for details.
 *Built with passion by a DevOps / System Engineer tired of proxy reloads.*
+
+```
