@@ -1,205 +1,333 @@
-pub mod routing;
-pub mod sys;
-pub mod telemetry;
-pub mod tls;
-
+use base64::{engine::general_purpose, Engine as _};
 use dashmap::DashMap;
-use std::net::SocketAddr;
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
+use rustls::{Certificate, PrivateKey, ServerConfig};
+use serde::Deserialize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::watch;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::mpsc;
+use tokio::time::{timeout, Duration};
+use tokio_rustls::TlsAcceptor;
+use tokio_util::sync::CancellationToken;
 
-use routing::circuit_breaker::CircuitBreaker;
-use sys::signals::wait_for_shutdown;
-use telemetry::atomics::AtomicMetrics;
-use telemetry::exporter::start_prometheus_exporter;
-use tls::acceptor::start_tls_server;
-use tls::cert_store::SilexCertResolver;
-use rustls::sign::CertifiedKey;
-
-fn extract_host(buf: &[u8]) -> Option<&str> {
-    let mut idx = 0;
-    while idx < buf.len() {
-        if let Some(n) = buf[idx..].iter().position(|&b| b == b'\n') {
-            let line = &buf[idx..idx + n];
-            if line.len() > 5 && line[..5].eq_ignore_ascii_case(b"host:") {
-                let mut val_start = 5;
-                while val_start < line.len() && (line[val_start] == b' ' || line[val_start] == b'\t') {
-                    val_start += 1;
-                }
-                let mut val_end = line.len();
-                if val_end > val_start && line[val_end - 1] == b'\r' {
-                    val_end -= 1;
-                }
-                if let Ok(host_str) = std::str::from_utf8(&line[val_start..val_end]) {
-                    return Some(host_str.split(':').next().unwrap_or(host_str));
-                }
-            }
-            idx += n + 1;
-        } else {
-            break;
-        }
-    }
-    None
+struct Metrics {
+    total_req: AtomicU64,
+    active_conn: AtomicU64,
+    err_5xx: AtomicU64,
 }
 
-fn extract_json_value<'a>(buf: &'a [u8], key: &[u8]) -> Option<&'a str> {
-    let mut pos = 0;
-    while pos + key.len() + 3 <= buf.len() {
-        if buf[pos] == b'"' && &buf[pos + 1..pos + 1 + key.len()] == key && buf[pos + 1 + key.len()] == b'"' {
-            let mut c_pos = pos + key.len() + 2;
-            while c_pos < buf.len() && (buf[c_pos] == b' ' || buf[c_pos] == b':') {
-                if buf[c_pos] == b':' {
-                    let mut v_start = c_pos + 1;
-                    while v_start < buf.len() && buf[v_start] == b' ' {
-                        v_start += 1;
-                    }
-                    if v_start < buf.len() && buf[v_start] == b'"' {
-                        v_start += 1;
-                        if let Some(v_end_off) = buf[v_start..].iter().position(|&b| b == b'"') {
-                            return std::str::from_utf8(&buf[v_start..v_start + v_end_off]).ok();
-                        }
-                    }
-                    break;
-                }
-                c_pos += 1;
-            }
-        }
-        pos += 1;
-    }
-    None
+static METRICS: Metrics = Metrics {
+    total_req: AtomicU64::new(0),
+    active_conn: AtomicU64::new(0),
+    err_5xx: AtomicU64::new(0),
+};
+
+#[derive(Deserialize)]
+struct RoutePayload {
+    host: String,
+    ip: String,
 }
 
-async fn handle_proxy(
-    mut client: TcpStream,
-    buf: &[u8],
-    routes: Arc<DashMap<String, Vec<SocketAddr>>>,
-    cb: Arc<CircuitBreaker>,
-    metrics: Arc<AtomicMetrics>,
-) {
-    let start = tokio::time::Instant::now();
-    
-    let host = match extract_host(buf) {
-        Some(h) => h,
-        None => return,
-    };
+#[derive(Deserialize)]
+struct TlsPayload {
+    host: String,
+    cert: String,
+    key: String,
+}
 
-    let target_addrs = match routes.get(host) {
-        Some(r) => r.clone(),
-        None => return,
-    };
+#[derive(Deserialize)]
+struct RewritePayload {
+    old_path: String,
+    new_path: String,
+}
 
-    let mut selected_target = None;
-    for addr in target_addrs.iter() {
-        if cb.is_healthy(addr) {
-            selected_target = Some(*addr);
-            break;
+struct SniResolver {
+    certs: Arc<DashMap<String, Arc<CertifiedKey>>>,
+}
+
+impl ResolvesServerCert for SniResolver {
+    fn resolve(&self, client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
+        if let Some(sni) = client_hello.server_name() {
+            if let Some(cert) = self.certs.get(sni) {
+                return Some(cert.value().clone());
+            }
         }
-    }
-
-    let target = match selected_target {
-        Some(t) => t,
-        None => return,
-    };
-
-    if let Ok(mut server) = TcpStream::connect(target).await {
-        if server.write_all(buf).await.is_ok() {
-            let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
-            metrics.record_request(start.elapsed().as_millis() as u64);
-        }
+        None
     }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    
-    let routes: Arc<DashMap<String, Vec<SocketAddr>>> = Arc::new(DashMap::new());
-    let cb = Arc::new(CircuitBreaker::new());
-    let metrics = Arc::new(AtomicMetrics::new());
+async fn main() -> std::io::Result<()> {
+    let routes = Arc::new(DashMap::new());
+    let tls_certs = Arc::new(DashMap::new());
+    let rewrites = Arc::new(DashMap::new());
+    let cancel_token = CancellationToken::new();
+    let (log_tx, mut log_rx) = mpsc::channel::<(String, u16)>(10000);
 
-    let shutdown_tx_clone = shutdown_tx.clone();
     tokio::spawn(async move {
-        wait_for_shutdown(shutdown_tx_clone).await;
-    });
-
-    let cb_monitor = cb.clone();
-    tokio::spawn(async move {
-        CircuitBreaker::monitor(cb_monitor).await;
-    });
-
-    let metrics_exporter = metrics.clone();
-    tokio::spawn(async move {
-        let _ = start_prometheus_exporter("0.0.0.0:9091", metrics_exporter).await;
-    });
-
-    if let (Ok(cert_bytes), Ok(key_bytes)) = (std::fs::read("cert.der"), std::fs::read("key.der")) {
-        if let Ok(key) = rustls::sign::any_supported_type(&rustls::PrivateKey(key_bytes)) {
-            let cert = rustls::Certificate(cert_bytes);
-            let fallback = Arc::new(CertifiedKey::new(vec![cert], key));
-            let resolver = Arc::new(SilexCertResolver::new(fallback));
-            
-            if let Ok(tls_listener) = TcpListener::bind("0.0.0.0:443").await {
-                let rx_tls = shutdown_rx.clone();
-                tokio::spawn(async move {
-                    let _ = start_tls_server(tls_listener, resolver, rx_tls).await;
-                });
-            }
+        while let Some((host, status)) = log_rx.recv().await {
+            println!("ACCESS: host={} status={}", host, status);
         }
-    }
+    });
 
-    let admin_listener = TcpListener::bind("127.0.0.1:9090").await?;
-    let routes_admin = routes.clone();
-    let cb_admin = cb.clone();
-    let mut admin_rx = shutdown_rx.clone();
+    let token_clone = cancel_token.clone();
+    tokio::spawn(async move {
+        let mut sigint = signal(SignalKind::interrupt()).unwrap();
+        let mut sigterm = signal(SignalKind::terminate()).unwrap();
+        tokio::select! {
+            _ = sigint.recv() => {}
+            _ = sigterm.recv() => {}
+        }
+        token_clone.cancel();
+    });
+
+    let routes_api = routes.clone();
+    let tls_certs_api = tls_certs.clone();
+    let rewrites_api = rewrites.clone();
+    let api_token = cancel_token.clone();
     
     tokio::spawn(async move {
+        let listener = TcpListener::bind("0.0.0.0:9090").await.unwrap();
         loop {
             tokio::select! {
-                Ok((mut stream, _)) = admin_listener.accept() => {
-                    let routes_admin = routes_admin.clone();
-                    let cb_admin = cb_admin.clone();
+                _ = api_token.cancelled() => break,
+                Ok((mut stream, _)) = listener.accept() => {
+                    let routes_clone = routes_api.clone();
+                    let tls_clone = tls_certs_api.clone();
+                    let rewrites_clone = rewrites_api.clone();
                     tokio::spawn(async move {
-                        let mut buf = [0u8; 1024];
+                        let mut buf = [0; 4096];
                         if let Ok(n) = stream.read(&mut buf).await {
-                            if let (Some(host), Some(ip_str)) = (extract_json_value(&buf[..n], b"host"), extract_json_value(&buf[..n], b"ip")) {
-                                if let Ok(addr) = ip_str.parse::<SocketAddr>() {
-                                    routes_admin.entry(host.to_string()).or_insert_with(Vec::new).push(addr);
-                                    cb_admin.register(addr);
+                            let req = String::from_utf8_lossy(&buf[..n]);
+                            if req.starts_with("GET /metrics") {
+                                let body = format!(
+                                    "silex_requests_total {}\nsilex_connections_active {}\nsilex_errors_5xx {}\n",
+                                    METRICS.total_req.load(Ordering::Relaxed),
+                                    METRICS.active_conn.load(Ordering::Relaxed),
+                                    METRICS.err_5xx.load(Ordering::Relaxed)
+                                );
+                                let header = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(header.as_bytes()).await;
+                                let _ = stream.write_all(body.as_bytes()).await;
+                            } else if let Some(body_start) = req.find("\r\n\r\n") {
+                                let body = &req[body_start + 4..];
+                                if req.starts_with("POST /tls") {
+                                    if let Ok(payload) = serde_json::from_str::<TlsPayload>(body) {
+                                        if let (Ok(cert_b), Ok(key_b)) = (general_purpose::STANDARD.decode(&payload.cert), general_purpose::STANDARD.decode(&payload.key)) {
+                                            let mut cert_reader = std::io::Cursor::new(cert_b);
+                                            if let Ok(certs) = rustls_pemfile::certs(&mut cert_reader) {
+                                                let cert_chain = certs.into_iter().map(Certificate).collect();
+                                                let mut key_reader = std::io::Cursor::new(&key_b);
+                                                let mut keys = rustls_pemfile::pkcs8_private_keys(&mut key_reader).unwrap_or_default();
+                                                if keys.is_empty() {
+                                                    let mut key_reader = std::io::Cursor::new(&key_b);
+                                                    keys = rustls_pemfile::rsa_private_keys(&mut key_reader).unwrap_or_default();
+                                                }
+                                                if !keys.is_empty() {
+                                                    if let Ok(key) = rustls::sign::any_supported_type(&PrivateKey(keys.remove(0))) {
+                                                        let certified_key = CertifiedKey::new(cert_chain, key);
+                                                        tls_clone.insert(payload.host, Arc::new(certified_key));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK").await;
+                                    }
+                                } else if req.starts_with("POST /rewrite") {
+                                    if let Ok(payload) = serde_json::from_str::<RewritePayload>(body) {
+                                        rewrites_clone.insert(payload.old_path.into_bytes(), payload.new_path.into_bytes());
+                                        let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK").await;
+                                    }
+                                } else if let Ok(payload) = serde_json::from_str::<RoutePayload>(body) {
+                                    routes_clone.insert(payload.host, payload.ip);
                                     let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK").await;
                                 }
                             }
                         }
                     });
                 }
-                _ = admin_rx.changed() => break,
             }
         }
     });
 
-    let http_listener = TcpListener::bind("0.0.0.0:80").await?;
-    let mut main_rx = shutdown_rx.clone();
+    let resolver = Arc::new(SniResolver { certs: tls_certs.clone() });
+    let mut server_config = ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let tls_acceptor = TlsAcceptor::from(Arc::new(server_config));
 
+    let listener_80 = TcpListener::bind("0.0.0.0:80").await?;
+    let listener_443 = TcpListener::bind("0.0.0.0:443").await?;
+
+    let routes_80 = routes.clone();
+    let rewrites_80 = rewrites.clone();
+    let log_tx_80 = log_tx.clone();
+    let token_80 = cancel_token.clone();
+    
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = token_80.cancelled() => break,
+                Ok((stream, _)) = listener_80.accept() => {
+                    METRICS.active_conn.fetch_add(1, Ordering::Relaxed);
+                    let peer_ip = stream.peer_addr().map(|a| a.ip().to_string().into_bytes()).unwrap_or_default();
+                    let routes_ref = routes_80.clone();
+                    let rewrites_ref = rewrites_80.clone();
+                    let log_tx_ref = log_tx_80.clone();
+                    tokio::spawn(async move {
+                        let _ = timeout(
+                            Duration::from_secs(30),
+                            handle_connection(stream, routes_ref, rewrites_ref, log_tx_ref, peer_ip)
+                        ).await;
+                        METRICS.active_conn.fetch_sub(1, Ordering::Relaxed);
+                    });
+                }
+            }
+        }
+    });
+
+    let routes_443 = routes.clone();
+    let rewrites_443 = rewrites.clone();
+    let log_tx_443 = log_tx.clone();
+    let token_443 = cancel_token.clone();
+    
     loop {
         tokio::select! {
-            Ok((stream, _)) = http_listener.accept() => {
-                let routes = routes.clone();
-                let cb = cb.clone();
-                let metrics = metrics.clone();
-                
+            _ = token_443.cancelled() => break,
+            Ok((stream, _)) = listener_443.accept() => {
+                METRICS.active_conn.fetch_add(1, Ordering::Relaxed);
+                let peer_ip = stream.peer_addr().map(|a| a.ip().to_string().into_bytes()).unwrap_or_default();
+                let routes_ref = routes_443.clone();
+                let rewrites_ref = rewrites_443.clone();
+                let log_tx_ref = log_tx_443.clone();
+                let tls_acc = tls_acceptor.clone();
                 tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    let mut client = stream;
-                    if let Ok(n) = client.read(&mut buf).await {
-                        if n > 0 {
-                            handle_proxy(client, &buf[..n], routes, cb, metrics).await;
-                        }
+                    if let Ok(tls_stream) = tls_acc.accept(stream).await {
+                        let _ = timeout(
+                            Duration::from_secs(30),
+                            handle_connection(tls_stream, routes_ref, rewrites_ref, log_tx_ref, peer_ip)
+                        ).await;
                     }
+                    METRICS.active_conn.fetch_sub(1, Ordering::Relaxed);
                 });
             }
-            _ = main_rx.changed() => break,
         }
+    }
+
+    Ok(())
+}
+
+async fn handle_connection<S>(
+    mut client_stream: S, 
+    routes: Arc<DashMap<String, String>>, 
+    rewrites: Arc<DashMap<Vec<u8>, Vec<u8>>>,
+    log_tx: mpsc::Sender<(String, u16)>,
+    peer_ip: Vec<u8>
+) -> std::io::Result<()>
+where S: tokio::io::AsyncReadExt + tokio::io::AsyncWriteExt + Unpin
+{
+    METRICS.total_req.fetch_add(1, Ordering::Relaxed);
+    
+    let mut buf = [0; 4096];
+    let mut n = 0;
+    
+    while n < buf.len() {
+        match client_stream.read(&mut buf[n..]).await {
+            Ok(0) => return Ok(()),
+            Ok(bytes_read) => {
+                n += bytes_read;
+                if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    let mut headers_end = 0;
+    for i in 0..n.saturating_sub(3) {
+        if buf[i] == b'\r' && buf[i+1] == b'\n' && buf[i+2] == b'\r' && buf[i+3] == b'\n' {
+            headers_end = i;
+            break;
+        }
+    }
+
+    let mut path_start = 0;
+    let mut path_end = 0;
+    for i in 0..headers_end {
+        if buf[i] == b' ' {
+            if path_start == 0 {
+                path_start = i + 1;
+            } else if path_end == 0 {
+                path_end = i;
+                break;
+            }
+        }
+    }
+
+    let mut rewritten_path = None;
+    if path_start > 0 && path_end > path_start {
+        let path = &buf[path_start..path_end];
+        if let Some(entry) = rewrites.get(path) {
+            rewritten_path = Some(entry.value().clone());
+        }
+    }
+
+    let mut target_ip = None;
+    let mut host_str = String::new();
+
+    for i in 0..headers_end {
+        if buf[i..].starts_with(b"Host: ") {
+            let start = i + 6;
+            if let Some(end) = buf[start..n].iter().position(|&b| b == b'\r') {
+                if let Ok(host) = std::str::from_utf8(&buf[start..start + end]) {
+                    host_str = host.to_string();
+                    if let Some(entry) = routes.get(host) {
+                        target_ip = Some(entry.value().clone());
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    if let Some(ip) = target_ip {
+        if let Ok(mut backend_stream) = TcpStream::connect(ip).await {
+            if let Some(new_p) = rewritten_path {
+                let _ = backend_stream.write_all(&buf[..path_start]).await;
+                let _ = backend_stream.write_all(&new_p).await;
+                let _ = backend_stream.write_all(&buf[path_end..headers_end]).await;
+            } else {
+                let _ = backend_stream.write_all(&buf[..headers_end]).await;
+            }
+
+            let _ = backend_stream.write_all(b"\r\nX-Forwarded-For: ").await;
+            let _ = backend_stream.write_all(&peer_ip).await;
+            let _ = backend_stream.write_all(b"\r\nX-Real-IP: ").await;
+            let _ = backend_stream.write_all(&peer_ip).await;
+            let _ = backend_stream.write_all(b"\r\n\r\n").await;
+            let _ = backend_stream.write_all(&buf[headers_end+4..n]).await;
+
+            let _ = tokio::io::copy_bidirectional(&mut client_stream, &mut backend_stream).await;
+            let _ = log_tx.try_send((host_str, 200));
+        } else {
+            METRICS.err_5xx.fetch_add(1, Ordering::Relaxed);
+            let _ = log_tx.try_send((host_str, 502));
+            let _ = client_stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n").await;
+        }
+    } else {
+        METRICS.err_5xx.fetch_add(1, Ordering::Relaxed);
+        let _ = log_tx.try_send((host_str, 404));
+        let _ = client_stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n").await;
     }
 
     Ok(())

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"os"
 	"os/signal"
@@ -52,6 +53,21 @@ func main() {
 }
 
 func processIngress(client *kubernetes.Clientset, ing *networkingv1.Ingress) {
+	for _, tls := range ing.Spec.TLS {
+		secret, err := client.CoreV1().Secrets(ing.Namespace).Get(context.Background(), tls.SecretName, metav1.GetOptions{})
+		if err == nil {
+			certData := base64.StdEncoding.EncodeToString(secret.Data["tls.crt"])
+			keyData := base64.StdEncoding.EncodeToString(secret.Data["tls.key"])
+			for _, host := range tls.Hosts {
+				_ = sync.SendTLSUpdate(types.TLSPayload{
+					Host: host,
+					Cert: certData,
+					Key:  keyData,
+				})
+			}
+		}
+	}
+
 	for _, rule := range ing.Spec.Rules {
 		if rule.Host == "" || rule.HTTP == nil {
 			continue
@@ -100,7 +116,6 @@ func processEndpointSlice(client *kubernetes.Clientset, slice *discoveryv1.Endpo
 
 func sendUpdatesFromSlice(host string, port int32, slice *discoveryv1.EndpointSlice) {
 	for _, ep := range slice.Endpoints {
-		// Only route to Pods that are fully healthy and ready!
 		if ep.Conditions.Ready != nil && *ep.Conditions.Ready {
 			for _, ip := range ep.Addresses {
 				target := fmt.Sprintf("%s:%d", ip, port)
