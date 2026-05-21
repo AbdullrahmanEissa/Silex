@@ -1,3 +1,4 @@
+<img width="1595" height="414" alt="Screenshot from 2026-05-21 10-25-12" src="https://github.com/user-attachments/assets/b6c48e00-3db6-406e-9e3e-52bf33a3332e" />
 # Silex Ingress: A High-Throughput, Zero-Allocation Data Plane for Cloud-Native Environments
 
 ## Abstract
