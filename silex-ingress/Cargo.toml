@@ -10,10 +10,12 @@ atomic_enum = "0.3.0"
 base64 = "0.21.5"
 bytes = "1.11.1"
 dashmap = "6.1.0"
+httparse = "1.10.1"
 rustls = "0.21.8"
 rustls-pemfile = "1.0.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
+socket2 = "0.6.3"
 tokio = { version = "1", features = ["full", "signal", "net", "time", "rt-multi-thread", "io-util", "macros", "sync"] }
 tokio-rustls = "0.24.1"
 tokio-util = "0.7.18"
