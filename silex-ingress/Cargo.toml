@@ -1,21 +1,162 @@
-[package]
-name = "silex-ingress"
-version = "0.1.0"
-edition = "2021"
+use dashmap::DashMap;
+use hyper::client::HttpConnector;
+use hyper::service::{make_service_fn, service_fn};
+use hyper::{Body, Client, Request, Response, Server, Uri};
+use serde::Deserialize;
+use socket2::{Domain, Protocol, Socket, Type};
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio_util::sync::CancellationToken;
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+#[derive(Deserialize)]
+struct RoutePayload {
+    host: String,
+    ip: String,
+}
 
-[dependencies]
-atomic_enum = "0.3.0"
-base64 = "0.21.5"
-bytes = "1.11.1"
-dashmap = "6.1.0"
-httparse = "1.10.1"
-rustls = "0.21.8"
-rustls-pemfile = "1.0.3"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-socket2 = "0.6.3"
-tokio = { version = "1", features = ["full", "signal", "net", "time", "rt-multi-thread", "io-util", "macros", "sync"] }
-tokio-rustls = "0.24.1"
-tokio-util = "0.7.18"
+fn create_reuseport_listener(port: u16) -> std::io::Result<std::net::TcpListener> {
+    let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
+    let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    socket.set_reuse_port(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(65535)?;
+    Ok(socket.into())
+}
+
+async fn proxy_handler(
+    mut req: Request<Body>,
+    client: Client<HttpConnector>,
+    routes: Arc<DashMap<String, String>>,
+) -> Result<Response<Body>, Infallible> {
+    let host_str = match req.headers().get(hyper::header::HOST) {
+        Some(h) => h.to_str().unwrap_or(""),
+        None => "",
+    };
+    
+    let clean_host = host_str.split(':').next().unwrap_or(host_str);
+
+    let target_ip = if let Some(entry) = routes.get(clean_host) {
+        entry.value().clone()
+    } else {
+        return Ok(Response::builder()
+            .status(404)
+            .body(Body::empty())
+            .unwrap());
+    };
+
+    let uri_string = format!(
+        "http://{}{}",
+        target_ip,
+        req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("/")
+    );
+    
+    *req.uri_mut() = uri_string.parse::<Uri>().unwrap();
+
+    match client.request(req).await {
+        Ok(res) => Ok(res),
+        Err(_) => Ok(Response::builder()
+            .status(502)
+            .body(Body::empty())
+            .unwrap()),
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let routes = Arc::new(DashMap::new());
+    let cancel_token = CancellationToken::new();
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+
+    let token_clone = cancel_token.clone();
+    tokio::spawn(async move {
+        let mut sigint = signal(SignalKind::interrupt()).unwrap();
+        let mut sigterm = signal(SignalKind::terminate()).unwrap();
+        tokio::select! {
+            _ = sigint.recv() => {}
+            _ = sigterm.recv() => {}
+        }
+        token_clone.cancel();
+    });
+
+    let routes_api = routes.clone();
+    let api_token = cancel_token.clone();
+    
+    tokio::spawn(async move {
+        let listener = TcpListener::bind("0.0.0.0:9090").await.unwrap();
+        loop {
+            tokio::select! {
+                _ = api_token.cancelled() => break,
+                Ok((mut stream, _)) = listener.accept() => {
+                    let routes_clone = routes_api.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0; 1024];
+                        if let Ok(n) = stream.read(&mut buf).await {
+                            let req = String::from_utf8_lossy(&buf[..n]);
+                            if let Some(body_start) = req.find("\r\n\r\n") {
+                                let body = &req[body_start + 4..];
+                                if let Ok(payload) = serde_json::from_str::<RoutePayload>(body) {
+                                    routes_clone.insert(payload.host, payload.ip);
+                                    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK").await;
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    println!("==================================================");
+    println!("🔥 Silex Apex L7 Ingress is ACTIVE.");
+    println!("🔥 Engine: HYPER (Persistent Connection Pool)");
+    println!("🔥 Running on {} Parallel Cores.", cores);
+    println!("🔥 Listening on port 8888 (Kubernetes Bypass Mode).");
+    println!("==================================================");
+
+    let hyper_client = Client::builder()
+        .pool_max_idle_per_host(500)
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .build_http();
+
+    for _ in 0..cores {
+        let std_listener = create_reuseport_listener(8888)?;
+        std_listener.set_nonblocking(true)?;
+        
+        let client_ref = hyper_client.clone();
+        let routes_ref = routes.clone();
+        let token_ref = cancel_token.clone();
+
+        tokio::spawn(async move {
+            let make_svc = make_service_fn(move |_conn| {
+                let client = client_ref.clone();
+                let routes = routes_ref.clone();
+                async move {
+                    Ok::<_, Infallible>(service_fn(move |req| {
+                        proxy_handler(req, client.clone(), routes.clone())
+                    }))
+                }
+            });
+
+            let server = Server::from_tcp(std_listener)
+                .unwrap()
+                .serve(make_svc)
+                .with_graceful_shutdown(async move {
+                    token_ref.cancelled().await;
+                });
+
+            if let Err(e) = server.await {
+                eprintln!("Server error: {}", e);
+            }
+        });
+    }
+
+    cancel_token.cancelled().await;
+    Ok(())
+}
